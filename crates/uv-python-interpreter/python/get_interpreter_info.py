@@ -610,16 +610,20 @@ def get_operating_system_and_architecture():
     return {"os": operating_system, "arch": architecture}
 
 
-def _get_cpu_info():
+def _get_cpu_info(*, arm64):
     """Return raw data so Rust can interpret additional features from the cache.
 
-    The platform-specific probes mostly follow archspec's CPU detection.
+    The x86-64 probes mostly follow archspec's CPU detection.
     """
     if sys.platform == "darwin":
-        return _macos_cpu_info()
+        return _macos_cpu_info(arm64=arm64)
     elif os.name == "nt":
+        if arm64:
+            return _windows_arm64_cpu_info()
         return _windows_cpu_info()
     elif sys.platform == "linux":
+        if arm64:
+            return _linux_aarch64_cpu_info()
         flags = _linux_cpu_flags()
         if flags:
             return {"kind": "flags", "flags": flags}
@@ -642,13 +646,14 @@ def _linux_cpu_flags():
     return None
 
 
-def _macos_cpu_info():
+def _macos_cpu_info(*, arm64):
     import ctypes
+    import errno
 
-    # archspec reads these x86 feature keys using the sysctl command. Query them from this
-    # process instead: a separate executable could run under a different architecture.
+    # Query sysctl from this process because a separate executable could run under a
+    # different architecture. The x86 feature keys follow archspec's macOS probe.
     # https://github.com/archspec/archspec/blob/ebd3eb502d9205f1033ffc028d661f2fbece7dfc/archspec/cpu/detect.py#L290-L300
-    sysctl = ctypes.CDLL(None).sysctlbyname
+    sysctl = ctypes.CDLL(None, use_errno=True).sysctlbyname
     sysctl.argtypes = [
         ctypes.c_char_p,
         ctypes.c_void_p,
@@ -656,22 +661,81 @@ def _macos_cpu_info():
         ctypes.c_void_p,
         ctypes.c_size_t,
     ]
+
+    def query(key, buffer, size):
+        if sysctl(key, buffer, ctypes.byref(size), None, 0) == 0:
+            return True
+        error = ctypes.get_errno()
+        if arm64 and error != errno.ENOENT:
+            raise OSError(error, os.strerror(error), key.decode("ascii"))
+        return False
+
+    if arm64:
+        keys = (b"machdep.cpu.brand_string",)
+    else:
+        keys = (
+            b"machdep.cpu.features",
+            b"machdep.cpu.leaf7_features",
+            b"machdep.cpu.extfeatures",
+        )
     flags = []
     # A missing key must not hide features available through another key.
-    for key in (
-        b"machdep.cpu.features",
-        b"machdep.cpu.leaf7_features",
-        b"machdep.cpu.extfeatures",
-    ):
+    for key in keys:
         size = ctypes.c_size_t()
-        if sysctl(key, None, ctypes.byref(size), None, 0) != 0 or size.value == 0:
+        if not query(key, None, size) or size.value == 0:
             continue
         buffer = ctypes.create_string_buffer(size.value)
-        if sysctl(key, buffer, ctypes.byref(size), None, 0) == 0:
-            flags.append(buffer.value.decode("ascii", errors="replace"))
+        if not query(key, buffer, size):
+            continue
+        value = buffer.value.decode("ascii", errors="replace")
+        if arm64:
+            if value:
+                return {"kind": "apple_silicon", "brand": value}
+            break
+        flags.append(value)
     if flags:
         return {"kind": "flags", "flags": " ".join(flags)}
     return {"kind": "unavailable"}
+
+
+def _linux_aarch64_cpu_info():
+    import ctypes
+
+    # The auxiliary vector describes instructions available to this process, even under
+    # emulation. /proc/cpuinfo can reflect the host and is only used to identify core models.
+    getauxval = ctypes.CDLL(None).getauxval
+    getauxval.argtypes = [ctypes.c_ulong]
+    getauxval.restype = ctypes.c_ulong
+    cores = set()
+    with open("/proc/cpuinfo", encoding="ascii", errors="replace") as cpuinfo:
+        for entry in cpuinfo.read().split("\n\n"):
+            fields = {}
+            for line in entry.splitlines():
+                key, _, value = line.partition(":")
+                key = key.strip()
+                if key in ("processor", "CPU implementer", "CPU part"):
+                    fields[key] = value.strip()
+            if "processor" in fields:
+                cores.add(
+                    (fields.get("CPU implementer", ""), fields.get("CPU part", ""))
+                )
+    return {
+        "kind": "linux_aarch64",
+        "cores": sorted(cores),
+        # AT_HWCAP through AT_HWCAP4. Missing entries read as zero on older kernels.
+        "hwcaps": [getauxval(key) for key in (16, 26, 29, 30)],
+    }
+
+
+def _windows_arm64_cpu_info():
+    import ctypes
+
+    present = ctypes.WinDLL("kernel32").IsProcessorFeaturePresent
+    present.argtypes = [ctypes.c_uint32]
+    present.restype = ctypes.c_int
+    # Windows allocates PROCESSOR_FEATURE_MAX (64) entries for processor feature IDs.
+    features = sum(1 << feature for feature in range(64) if present(feature))
+    return {"kind": "windows_arm64", "features": features}
 
 
 def _windows_cpu_info():
@@ -801,9 +865,11 @@ def main() -> None:
 
     os_and_arch = get_operating_system_and_architecture()
     cpu_info = None
-    if os_and_arch["arch"].lower() in ("x86_64", "amd64"):
+    architecture = os_and_arch["arch"].lower()
+    arm64 = architecture in ("aarch64", "arm64")
+    if arm64 or architecture in ("x86_64", "amd64"):
         try:
-            cpu_info = _get_cpu_info()
+            cpu_info = _get_cpu_info(arm64=arm64)
         except Exception as error:
             # Rust applies the preview policy to probe failures.
             cpu_info = {

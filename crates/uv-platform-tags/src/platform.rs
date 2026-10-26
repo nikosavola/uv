@@ -37,6 +37,16 @@ pub enum CpuInfo {
     Flags { flags: Box<str> },
     /// Raw CPUID registers and OS-enabled register state (XCR0), queried directly on Windows.
     Cpuid { leaves: Vec<CpuidLeaf>, xstate: u64 },
+    /// Apple Silicon model reported by `machdep.cpu.brand_string`.
+    AppleSilicon { brand: Box<str> },
+    /// Linux core IDs from `/proc/cpuinfo` and process-wide capabilities from the auxiliary vector.
+    LinuxAarch64 {
+        cores: Vec<(Box<str>, Box<str>)>,
+        /// `AT_HWCAP` through `AT_HWCAP4`, in order.
+        hwcaps: [u64; 4],
+    },
+    /// Feature bits reported by Windows' `IsProcessorFeaturePresent`.
+    WindowsArm64 { features: u64 },
     /// No probe or CPU data was available; `error` contains a probe failure, if one occurred.
     Unavailable { error: Option<Box<str>> },
 }
@@ -70,6 +80,7 @@ impl Platform {
     }
 
     /// Attach raw CPU capabilities reported by the Python interpreter.
+    #[must_use]
     pub fn with_cpu_info(mut self, cpu_info: Option<CpuInfo>) -> Self {
         self.cpu_info = cpu_info.map(Arc::new);
         self
